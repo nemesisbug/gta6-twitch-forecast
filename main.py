@@ -1,22 +1,39 @@
 """Offline, first-hour-conditioned launch curves; Python standard library only.
 
-v2 changes vs v1 (validated by leave-one-launch-out over 37 comparable
+v3 changes vs v2 (validated by leave-one-launch-out over 37 comparable
 launches; practice loss is server-only, so LOO is the decision metric):
 
-- Center: ridge regression (ridge 1.0) on [log hour-1 viewers, log pre-release
-  median, log channels/viewers], standardized on weighted train moments.
-  LOO BIG (hour-1 >= 50k) 0.204 -> 0.192 on this change alone.
-- Console-similarity weight 1.5 on the Gaussian kernel (bandwidth 1.25).
-- Anchor shrinkage: the hour-1 print is shrunk 5% toward the pre-release-
-  implied scale B when the print is a single hourly read (reads < 30).
-  A precise multi-read print (the final case, reads >= 30) is trusted as-is,
-  because the shrinkage only corrects noise that a precise print lacks.
-- Quantile spread: weighted residual std, clamped [0.25, 2.5], scaled by 0.85.
+- Scale-adaptive bandwidth + ridge (the big win). Small launches are noisy
+  and need pooling; big launches are information-rich and need locality:
+  p1 < 50k   -> bw 1.6, ridge 4.0
+  50k-130k   -> bw 0.8, ridge 0.5
+  p1 >= 130k -> bw 0.6, ridge 0.25
+  LOO BIG (hour-1 >= 50k) 0.1805 -> 0.1624; proxy practice 0.168 -> 0.150.
+- Pooled standardized-residual quantile shape (cross-conformal style).
+  The lognormal z is replaced by empirical quantiles of standardized
+  inner-LOO residuals, pooled over all train launches x 23 hours and
+  shrunk 50% toward the normal z. This also corrects the median bias
+  (residual median != 0). The shape is recomputed inside every outer
+  LOO fold (nested jackknife) and, at runtime, inside every case from
+  that case's own comparables -- never reused across cases.
+- Upper tail narrowed: tail_hi 0.85 (lower tail unchanged, 1.0).
 
-LOO (37 launches): ALL 0.402, BIG 0.181 (v1: ALL 0.390, BIG 0.204);
-paired bootstrap on BIG: mean delta -0.020, 95% CI [-0.037, -0.003].
-Mixture quantiles, k-NN centers, LAD centers, pre-release trend features and
-recency decay were all tested and rejected (worse on LOO BIG).
+LOO (37 launches): ALL 0.382, BIG 0.162 (v2: ALL 0.402, BIG 0.181);
+proxy practice ~0.150 (v2: ~0.168); top-20 practice bar is ~0.137, so
+v3 is better than v2 but still short of the top-20 bar -- per the
+standing top-score gate it is staged, NOT submitted.
+Paired bootstrap on BIG vs v2: mean delta -0.018, 95% CI [-0.034, +0.005],
+18/20 BIG launches improve.
+
+Rejected in the v3 round (all tested on LOO BIG, worse or neutral):
+mixture quantiles (alone and as 0.2 admixture), LAD/quantile-regression
+center, k-NN center, median+IQR center, pre-release trend/spike features,
+recency decay, quality down-weight, Hogwarts/Cyberpunk exclusion,
+spread floor 0.15, bw 2.303, guarded stretch gamma, hour-smoothing of
+center (James-Stein shrinkage), peak-hour feature, pooled shared-slope
+model, vitality shrinkage (redundant with adaptivity), excluding
+simultaneous-global or early-access launches from the pool, Student-t
+quantiles, heteroskedastic spread growing with h.
 """
 import json
 import math
@@ -25,9 +42,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
-BANDWIDTH = 1.25
-RIDGE = 1.0
+TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
 SPREAD_MULT = 0.85
+TAIL_HI = 0.85
+TAIL_LO = 1.0
 LAMBDA_NOISY = 0.95
 READS_PRECISE = 30
 SIM_WEIGHT = 1.5
@@ -35,6 +53,17 @@ FEATURES = ('logp1', 'logP', 'logch')
 PRE_RELEASE_DAYS = 14
 PRE_RELEASE_END_DAYS = 2
 MIN_PRE_RELEASE_POINTS = 24
+SHAPE_SHRINK = 0.5
+
+
+def params_for_p1(p1):
+    """Scale-adaptive (bandwidth, ridge): small launches need pooling,
+    big launches need locality."""
+    if p1 < 50000:
+        return 1.6, 4.0
+    if p1 < 130000:
+        return 0.8, 0.5
+    return 0.6, 0.25
 
 
 def pre_release_median(rows, day_start):
@@ -190,9 +219,10 @@ def fit(pool, p1, p_target, ch1_target, reads):
     """Return (log anchor, per-hour (center, spread)) for hours 2..24."""
     if len(pool) < 5:
         return math.log(p1), [(0.0, 0.15 * math.sqrt(h - 1)) for h in range(2, 25)]
+    bandwidth, ridge = params_for_p1(p1)
     logp1 = math.log(p1)
     xs = [math.log(c['v'][0]) for c in pool]
-    log_weights = [-0.5 * ((x - logp1) / BANDWIDTH) ** 2 for x in xs]
+    log_weights = [-0.5 * ((x - logp1) / bandwidth) ** 2 for x in xs]
     largest = max(log_weights)
     weights = []
     for curve, log_weight in zip(pool, log_weights):
@@ -230,7 +260,7 @@ def fit(pool, p1, p_target, ch1_target, reads):
         target_scale = max(p_target if p_target else p1, 10.0)
         target = {'v': [p1], 'P': target_scale, 'ch1': ch1_target}
         target_vec = [(feat_vecs(target, FEATURES)[j] - means[j]) / scales[j] for j in range(k)]
-        intercept, coefs = ridge_fit(standardized, ratios, weights, RIDGE)
+        intercept, coefs = ridge_fit(standardized, ratios, weights, ridge)
         center = intercept + sum(b * x for b, x in zip(coefs, target_vec))
         center = max(percentile(ratios, 0.02), min(percentile(ratios, 0.98), center))
         residual = sum(w * (r - (intercept + sum(b * x for b, x in zip(coefs, xi)))) ** 2
@@ -240,12 +270,43 @@ def fit(pool, p1, p_target, ch1_target, reads):
     return log_anchor, result
 
 
-def quantiles(log_anchor, center, spread):
+def residual_shape(pool):
+    """Empirical quantiles of standardized inner-LOO residuals, pooled over
+    all pool launches x 23 hours, shrunk 50% toward the normal z.
+
+    Each pool launch is forecast from the pool without it (its own hour-1
+    is a single SullyGnome read, so the noisy-read anchor applies); the
+    standardized residual (log miss / spread) is collected per hour.
+    Returns 5 shape values aligned with TAUS, or Z if the pool is tiny.
+    """
+    if len(pool) < 8:
+        return list(Z)
+    residuals = []
+    for j, launch in enumerate(pool):
+        inner = pool[:j] + pool[j + 1:]
+        log_a, params = fit(inner, launch['v'][0], launch['P'], launch['ch1'], 1)
+        for h_idx, h in enumerate(range(2, 25)):
+            y = math.log(max(launch['v'][h - 1], 1))
+            center, spread = params[h_idx]
+            residuals.append((y - (log_a + center)) / spread)
+    shape = []
+    for tau, z in zip(TAUS, Z):
+        shape.append(SHAPE_SHRINK * percentile(residuals, tau)
+                     + (1 - SHAPE_SHRINK) * z)
+    return shape
+
+
+def quantiles(log_anchor, center, spread, shape):
     values = []
-    for z in Z:
-        # Bound in log space before exponentiation, including extreme inputs.
+    med = shape[2]
+    for qf in shape:
+        gap = (qf - med) * spread
+        if gap > 0:
+            gap *= TAIL_HI
+        elif gap < 0:
+            gap *= TAIL_LO
         log_value = max(math.log(0.01), min(math.log(1e9),
-                        log_anchor + center + z * spread))
+                        log_anchor + center + med * spread + gap))
         value = math.exp(log_value)
         rounded = math.floor(value * 100 + 0.5) / 100
         values.append(int(rounded) if rounded.is_integer() else rounded)
@@ -261,7 +322,8 @@ def forecast(case):
     pool, pre_release_by_name = release_curves(case)
     p_target = target_pre_release(case, pre_release_by_name)
     log_anchor, parameters = fit(pool, p1, p_target, ch1, reads)
-    return {'hours': [{'hour': h, 'q': quantiles(log_anchor, *parameters[h - 2])}
+    shape = residual_shape(pool)
+    return {'hours': [{'hour': h, 'q': quantiles(log_anchor, *parameters[h - 2], shape)}
                       for h in range(2, 25)]}
 
 
