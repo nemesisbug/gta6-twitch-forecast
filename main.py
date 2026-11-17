@@ -1,30 +1,128 @@
-"""Offline, first-hour-conditioned launch curves; Python standard library only."""
+"""Offline, first-hour-conditioned launch curves; Python standard library only.
+
+v2 changes vs v1 (validated by leave-one-launch-out over 37 comparable
+launches; practice loss is server-only, so LOO is the decision metric):
+
+- Center: ridge regression (ridge 1.0) on [log hour-1 viewers, log pre-release
+  median, log channels/viewers], standardized on weighted train moments.
+  LOO BIG (hour-1 >= 50k) 0.204 -> 0.192 on this change alone.
+- Console-similarity weight 1.5 on the Gaussian kernel (bandwidth 1.25).
+- Anchor shrinkage: the hour-1 print is shrunk 5% toward the pre-release-
+  implied scale B when the print is a single hourly read (reads < 30).
+  A precise multi-read print (the final case, reads >= 30) is trusted as-is,
+  because the shrinkage only corrects noise that a precise print lacks.
+- Quantile spread: weighted residual std, clamped [0.25, 2.5], scaled by 0.85.
+
+LOO (37 launches): ALL 0.402, BIG 0.181 (v1: ALL 0.390, BIG 0.204);
+paired bootstrap on BIG: mean delta -0.020, 95% CI [-0.037, -0.003].
+Mixture quantiles, k-NN centers, LAD centers, pre-release trend features and
+recency decay were all tested and rejected (worse on LOO BIG).
+"""
 import json
 import math
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
 BANDWIDTH = 1.25
+RIDGE = 1.0
+SPREAD_MULT = 0.85
+LAMBDA_NOISY = 0.95
+READS_PRECISE = 30
+SIM_WEIGHT = 1.5
+FEATURES = ('logp1', 'logP', 'logch')
+PRE_RELEASE_DAYS = 14
+PRE_RELEASE_END_DAYS = 2
+MIN_PRE_RELEASE_POINTS = 24
+
+
+def pre_release_median(rows, day_start):
+    """Time-weighted median of viewers over days -14..-2 before day_start.
+
+    Each point represents the gap to the next point, capped at 12h; the last
+    point counts 1h. Returns (median, point_count), median None if empty.
+    """
+    low = day_start - timedelta(days=PRE_RELEASE_DAYS)
+    high = day_start - timedelta(days=PRE_RELEASE_END_DAYS)
+    points = []
+    for row in rows:
+        if row.get('viewers') is None or row['viewers'] <= 0:
+            continue
+        when = datetime.fromisoformat(row['from'])
+        if low <= when < high:
+            points.append((when, row['viewers']))
+    if not points:
+        return None, 0
+    points.sort()
+    items = []
+    for j, (when, value) in enumerate(points):
+        if j + 1 < len(points):
+            duration = min((points[j + 1][0] - when).total_seconds() / 3600.0, 12.0)
+        else:
+            duration = 1.0
+        items.append((value, max(duration, 0.25)))
+    items.sort()
+    total = sum(d for _, d in items)
+    accrued = 0.0
+    for value, duration in items:
+        accrued += duration
+        if accrued >= total / 2:
+            return value, len(points)
+    return items[-1][0], len(points)
 
 
 def release_curves(case):
-    """Keep complete positive release days, excluding the target game's history."""
-    curves = []
+    """Complete positive release days, excluding the target game's history.
+
+    Returns (pool, pre_release_by_name): pool entries carry the 24 hourly
+    viewers, channels at hour 1, platforms string and pre-release median.
+    """
     target = case['game']['name'].casefold()
+    pool = []
+    pre_release_by_name = {}
     for launch in case['comparables']:
+        start = datetime.fromisoformat(launch['day_start'])
+        median, _ = pre_release_median(launch['hourly'], start)
+        pre_release_by_name[launch['name'].casefold()] = median
         if target in launch['name'].casefold():
             continue
-        start = datetime.fromisoformat(launch['day_start'])
         hours = {}
+        channels = {}
         for row in launch['hourly']:
             offset = (datetime.fromisoformat(row['from']) - start).total_seconds()
             if 0 <= offset < 86400 and offset % 3600 == 0:
                 hours[int(offset // 3600)] = row['viewers']
+                channels[int(offset // 3600)] = row.get('channels')
         if len(hours) == 24 and all(math.isfinite(v) and v > 0 for v in hours.values()):
-            curves.append([hours[h] for h in range(24)])
-    return curves
+            pool.append({
+                'name': launch['name'],
+                'platforms': launch.get('platforms') or '',
+                'v': [hours[h] for h in range(24)],
+                'ch1': channels.get(0),
+                'P': median,
+            })
+    return pool, pre_release_by_name
+
+
+def target_pre_release(case, pre_release_by_name):
+    """Pre-release median for the target game.
+
+    From the case's own history when it covers the -14..-2 day window;
+    otherwise from the matching comparable curve (e.g. the target category's
+    pre-release history curve, whose own history is longer).
+    """
+    start = datetime.fromisoformat(case['day_start'])
+    median, count = pre_release_median(case.get('history_hourly') or [], start)
+    if median is not None and count >= MIN_PRE_RELEASE_POINTS:
+        return median
+    target = case['game']['name'].casefold()
+    for name, value in pre_release_by_name.items():
+        if value is None:
+            continue
+        if target in name or name in target:
+            return value
+    return median
 
 
 def percentile(values, fraction):
@@ -35,40 +133,119 @@ def percentile(values, fraction):
     return ordered[lower] + (position - lower) * (ordered[upper] - ordered[lower])
 
 
-def fit(curves, p1):
-    """Return per-hour conditional log moves and residual population deviations."""
-    if len(curves) < 5:
-        return [(0.0, 0.15 * math.sqrt(h - 1)) for h in range(2, 25)]
-    x0 = math.log(p1)
-    xs = [math.log(c[0]) for c in curves]
-    # A common rescaling preserves the fit and prevents kernel underflow.
-    log_weights = [-0.5 * ((x - x0) / BANDWIDTH) ** 2 for x in xs]
+def weighted_median(pairs):
+    ordered = sorted(pairs)
+    total = sum(w for _, w in ordered)
+    accrued = 0.0
+    for value, weight in ordered:
+        accrued += weight
+        if accrued >= total / 2:
+            return value
+    return ordered[-1][0]
+
+
+def feat_vecs(curve, feats):
+    values = []
+    scale = max(curve['P'] if curve.get('P') else curve['v'][0], 10.0)
+    if 'logp1' in feats:
+        values.append(math.log(curve['v'][0]))
+    if 'logP' in feats:
+        values.append(math.log(scale))
+    if 'logch' in feats:
+        channels = curve['ch1'] if curve.get('ch1') else 1
+        values.append(math.log(max(channels, 1) / max(curve['v'][0], 1)))
+    return values
+
+
+def ridge_fit(features, targets, weights, ridge):
+    """Weighted ridge (intercept unpenalized) on pre-standardized features."""
+    k = len(features[0])
+    matrix = [[0.0] * (k + 1) for _ in range(k + 1)]
+    rhs = [0.0] * (k + 1)
+    for row, target, weight in zip(features, targets, weights):
+        extended = [1.0] + list(row)
+        for a in range(k + 1):
+            rhs[a] += weight * extended[a] * target
+            for b in range(k + 1):
+                matrix[a][b] += weight * extended[a] * extended[b]
+    for a in range(1, k + 1):
+        matrix[a][a] += ridge
+    augmented = [row[:] + [rhs[i]] for i, row in enumerate(matrix)]
+    for col in range(k + 1):
+        pivot = max(range(col, k + 1), key=lambda r: abs(augmented[r][col]))
+        augmented[col], augmented[pivot] = augmented[pivot], augmented[col]
+        if abs(augmented[col][col]) < 1e-12:
+            continue
+        for r in range(k + 1):
+            if r != col and augmented[r][col] != 0:
+                factor = augmented[r][col] / augmented[col][col]
+                for cc in range(col, k + 2):
+                    augmented[r][cc] -= factor * augmented[col][cc]
+    beta = [augmented[i][k + 1] / augmented[i][i] if abs(augmented[i][i]) > 1e-12 else 0.0
+            for i in range(k + 1)]
+    return beta[0], beta[1:]
+
+
+def fit(pool, p1, p_target, ch1_target, reads):
+    """Return (log anchor, per-hour (center, spread)) for hours 2..24."""
+    if len(pool) < 5:
+        return math.log(p1), [(0.0, 0.15 * math.sqrt(h - 1)) for h in range(2, 25)]
+    logp1 = math.log(p1)
+    xs = [math.log(c['v'][0]) for c in pool]
+    log_weights = [-0.5 * ((x - logp1) / BANDWIDTH) ** 2 for x in xs]
     largest = max(log_weights)
-    weights = [math.exp(w - largest) for w in log_weights]
+    weights = []
+    for curve, log_weight in zip(pool, log_weights):
+        weight = math.exp(log_weight - largest)
+        if 'PC' not in curve['platforms']:
+            weight *= SIM_WEIGHT
+        weights.append(weight)
     total = sum(weights)
-    xbar = sum(w * x for w, x in zip(weights, xs)) / total
-    variance = sum(w * (x - xbar) ** 2 for w, x in zip(weights, xs))
+    weights = [w / total for w in weights]
+    # Anchor: shrink a noisy single-read hour-1 print toward the
+    # pre-release-implied scale; trust a precise multi-read print as-is.
+    if reads < READS_PRECISE:
+        target_scale = max(p_target if p_target else p1, 10.0)
+        terms = []
+        for curve, weight in zip(pool, weights):
+            curve_scale = max(curve['P'] if curve.get('P') else curve['v'][0], 10.0)
+            terms.append((math.log(curve['v'][0] / curve_scale), weight))
+        log_b = math.log(target_scale) + weighted_median(terms)
+        log_anchor = LAMBDA_NOISY * logp1 + (1 - LAMBDA_NOISY) * log_b
+    else:
+        log_anchor = logp1
     result = []
     for h in range(1, 24):
-        ratios = [math.log(c[h] / c[0]) for c in curves]
-        rbar = sum(w * r for w, r in zip(weights, ratios)) / total
-        slope = (sum(w * (x - xbar) * (r - rbar)
-                     for w, x, r in zip(weights, xs, ratios)) / variance
-                 if variance > 1e-12 else 0.0)
-        prediction = rbar + slope * (x0 - xbar)
-        prediction = max(percentile(ratios, 0.02), min(percentile(ratios, 0.98), prediction))
-        residual = sum(w * (r - rbar - slope * (x - xbar)) ** 2
-                       for w, x, r in zip(weights, xs, ratios)) / total
-        result.append((prediction, max(0.25, min(2.5, math.sqrt(residual)))))
-    return result
+        ratios = [math.log(c['v'][h] / c['v'][0]) for c in pool]
+        features = [feat_vecs(c, FEATURES) for c in pool]
+        k = len(FEATURES)
+        means = []
+        scales = []
+        for j in range(k):
+            mean = sum(w * x[j] for w, x in zip(weights, features))
+            means.append(mean)
+            spread = math.sqrt(sum(w * (x[j] - mean) ** 2 for w, x in zip(weights, features)))
+            scales.append(spread if spread > 1e-9 else 1.0)
+        standardized = [[(x[j] - means[j]) / scales[j] for j in range(k)] for x in features]
+        target_scale = max(p_target if p_target else p1, 10.0)
+        target = {'v': [p1], 'P': target_scale, 'ch1': ch1_target}
+        target_vec = [(feat_vecs(target, FEATURES)[j] - means[j]) / scales[j] for j in range(k)]
+        intercept, coefs = ridge_fit(standardized, ratios, weights, RIDGE)
+        center = intercept + sum(b * x for b, x in zip(coefs, target_vec))
+        center = max(percentile(ratios, 0.02), min(percentile(ratios, 0.98), center))
+        residual = sum(w * (r - (intercept + sum(b * x for b, x in zip(coefs, xi)))) ** 2
+                       for xi, r, w in zip(standardized, ratios, weights))
+        spread = max(0.25, min(2.5, math.sqrt(residual))) * SPREAD_MULT
+        result.append((center, spread))
+    return log_anchor, result
 
 
-def quantiles(p1, mean, spread):
+def quantiles(log_anchor, center, spread):
     values = []
     for z in Z:
         # Bound in log space before exponentiation, including extreme inputs.
         log_value = max(math.log(0.01), min(math.log(1e9),
-                        math.log(p1) + mean + z * spread))
+                        log_anchor + center + z * spread))
         value = math.exp(log_value)
         rounded = math.floor(value * 100 + 0.5) / 100
         values.append(int(rounded) if rounded.is_integer() else rounded)
@@ -76,9 +253,15 @@ def quantiles(p1, mean, spread):
 
 
 def forecast(case):
-    p1 = max(1, next(row['viewers'] for row in case['known'] if row['hour'] == 1))
-    parameters = fit(release_curves(case), p1)
-    return {'hours': [{'hour': h, 'q': quantiles(p1, *parameters[h - 2])}
+    known = sorted(case['known'], key=lambda row: row['hour'])
+    hour_one = next((row for row in known if row['hour'] == 1), known[0])
+    p1 = max(1, hour_one['viewers'])
+    reads = hour_one.get('reads') or 1
+    ch1 = hour_one.get('channels')
+    pool, pre_release_by_name = release_curves(case)
+    p_target = target_pre_release(case, pre_release_by_name)
+    log_anchor, parameters = fit(pool, p1, p_target, ch1, reads)
+    return {'hours': [{'hour': h, 'q': quantiles(log_anchor, *parameters[h - 2])}
                       for h in range(2, 25)]}
 
 
