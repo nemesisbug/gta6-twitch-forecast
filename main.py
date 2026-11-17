@@ -1,39 +1,39 @@
 """Offline, first-hour-conditioned launch curves; Python standard library only.
 
-v3 changes vs v2 (validated by leave-one-launch-out over 37 comparable
+v4 changes vs v3 (validated by leave-one-launch-out over 37 comparable
 launches; practice loss is server-only, so LOO is the decision metric):
 
-- Scale-adaptive bandwidth + ridge (the big win). Small launches are noisy
-  and need pooling; big launches are information-rich and need locality:
-  p1 < 50k   -> bw 1.6, ridge 4.0
-  50k-130k   -> bw 0.8, ridge 0.5
-  p1 >= 130k -> bw 0.6, ridge 0.25
-  LOO BIG (hour-1 >= 50k) 0.1805 -> 0.1624; proxy practice 0.168 -> 0.150.
-- Pooled standardized-residual quantile shape (cross-conformal style).
-  The lognormal z is replaced by empirical quantiles of standardized
-  inner-LOO residuals, pooled over all train launches x 23 hours and
-  shrunk 50% toward the normal z. This also corrects the median bias
-  (residual median != 0). The shape is recomputed inside every outer
-  LOO fold (nested jackknife) and, at runtime, inside every case from
-  that case's own comparables -- never reused across cases.
-- Upper tail narrowed: tail_hi 0.85 (lower tail unchanged, 1.0).
+- Huge launches are under-dispersed: the forecast spread is too narrow
+  for p1 >= 130k, so the truth falls outside the interval too often.
+  The LOO gain from widening the spread is concentrated at the tails
+  (tau=0.05 and tau=0.95) and on the worst launches (Starfield -0.036,
+  Ghost of Tsushima -0.033, Monster Hunter Wilds -0.017); the median
+  (tau=0.5) is unchanged -- the center is not the bottleneck, the tails
+  are. So: spread multiplier 1.2 (instead of 0.85) for p1 >= 130k only;
+  all other bands keep 0.85, tail_hi stays 0.85 for all bands.
+  LOO HUGE (hour-1 >= 130k) 0.1757 -> 0.1710; LOO BIG 0.1624 -> 0.1584;
+  proxy practice 0.1500 -> 0.1482.
+  Paired bootstrap on HUGE vs v3: mean delta -0.0046, 95% CI
+  [-0.0134, +0.0028], 6/13 huge launches improve (the improvers are the
+  high-loss ones, the losers are the already-well-covered ones) -- a
+  modest, mechanism-consistent gain, not statistically proven at n=13.
+  The final is ONE huge launch, so LOO HUGE is the decision metric.
+  Top-20 practice bar is ~0.137, so v4 is better than v3 but still short
+  of the top-20 bar -- per the standing top-score gate it is staged,
+  NOT submitted.
 
-LOO (37 launches): ALL 0.382, BIG 0.162 (v2: ALL 0.402, BIG 0.181);
-proxy practice ~0.150 (v2: ~0.168); top-20 practice bar is ~0.137, so
-v3 is better than v2 but still short of the top-20 bar -- per the
-standing top-score gate it is staged, NOT submitted.
-Paired bootstrap on BIG vs v2: mean delta -0.018, 95% CI [-0.034, +0.005],
-18/20 BIG launches improve.
-
-Rejected in the v3 round (all tested on LOO BIG, worse or neutral):
-mixture quantiles (alone and as 0.2 admixture), LAD/quantile-regression
-center, k-NN center, median+IQR center, pre-release trend/spike features,
-recency decay, quality down-weight, Hogwarts/Cyberpunk exclusion,
-spread floor 0.15, bw 2.303, guarded stretch gamma, hour-smoothing of
-center (James-Stein shrinkage), peak-hour feature, pooled shared-slope
-model, vitality shrinkage (redundant with adaptivity), excluding
-simultaneous-global or early-access launches from the pool, Student-t
-quantiles, heteroskedastic spread growing with h.
+Rejected in the v4 round (all tested on LOO HUGE, worse or neutral):
+tighter bandwidth/ridge for huge (bw 0.4-0.5, ridge 0.1-0.15), looser
+bandwidth for huge (bw 0.7-0.8), huge-only residual shape, huge-only
+training pool, hype reparameterization [logp1, hype, logch], feature
+subsets for huge (dropping logch or logp1), shrink center toward
+huge-band median ratio, per-hour-block huge shapes, tail_hi 0.75/1.0/1.15
+for huge, tail_lo 0.85 for huge, less shape shrink (0.25/0.0) for huge,
+pooled hour-invariant logP offset (Qwen's hierarchical-shrinkage idea:
+much worse, HUGE 0.189 -- per-hour logP coefficients carry real
+hour-specific information), lam=1.0 (final regime: HUGE 0.179 in LOO,
+but the final's precise multi-read p1 should land it closer to the
+lam=0.95 number).
 """
 import json
 import math
@@ -44,6 +44,7 @@ from pathlib import Path
 Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
 TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
 SPREAD_MULT = 0.85
+SPREAD_MULT_HUGE = 1.2
 TAIL_HI = 0.85
 TAIL_LO = 1.0
 LAMBDA_NOISY = 0.95
@@ -64,6 +65,13 @@ def params_for_p1(p1):
     if p1 < 130000:
         return 0.8, 0.5
     return 0.6, 0.25
+
+
+def spread_mult_for_p1(p1):
+    """Huge launches are under-dispersed (v4): the in-sample residual
+    spread underestimates the out-of-sample error most when the effective
+    pool is small, so widen the spread for p1 >= 130k only."""
+    return SPREAD_MULT_HUGE if p1 >= 130000 else SPREAD_MULT
 
 
 def pre_release_median(rows, day_start):
@@ -265,7 +273,7 @@ def fit(pool, p1, p_target, ch1_target, reads):
         center = max(percentile(ratios, 0.02), min(percentile(ratios, 0.98), center))
         residual = sum(w * (r - (intercept + sum(b * x for b, x in zip(coefs, xi)))) ** 2
                        for xi, r, w in zip(standardized, ratios, weights))
-        spread = max(0.25, min(2.5, math.sqrt(residual))) * SPREAD_MULT
+        spread = max(0.25, min(2.5, math.sqrt(residual))) * spread_mult_for_p1(p1)
         result.append((center, spread))
     return log_anchor, result
 
